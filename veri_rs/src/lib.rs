@@ -1,5 +1,5 @@
-pub mod poly;
 pub mod consolidation;
+pub mod poly;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right

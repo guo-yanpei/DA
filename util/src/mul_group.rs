@@ -3,6 +3,7 @@ use std::rc::Rc;
 use ark_bn254::Fr;
 use ark_ff::{FftField, Field, One, Zero};
 
+#[derive(Debug, Clone)]
 pub struct Radix2Group {
     log_order: usize,
     omega: Fr,
