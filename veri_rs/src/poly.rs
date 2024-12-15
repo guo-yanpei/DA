@@ -1,5 +1,6 @@
 use ark_bn254::Fr;
 use ark_ff::One;
+use ark_serialize::CanonicalSerialize;
 
 #[derive(Debug, Clone)]
 pub struct MultilinearPoly(Vec<Fr>);
@@ -44,6 +45,14 @@ impl UniVarPoly {
         UniVarPoly(coeff)
     }
 
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut bytes = vec![];
+        self.0.iter().for_each(|x| {
+            <Fr as CanonicalSerialize>::serialize_compressed(&x, &mut bytes).unwrap()
+        });
+        bytes
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -67,6 +76,14 @@ pub struct UniPolyEvals {
 impl UniPolyEvals {
     pub fn new(evals: Vec<Fr>, offset_inv: Fr) -> UniPolyEvals {
         UniPolyEvals { evals, offset_inv }
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut bytes = vec![];
+        self.evals.iter().for_each(|x| {
+            <Fr as CanonicalSerialize>::serialize_compressed(&x, &mut bytes).unwrap()
+        });
+        bytes
     }
 
     pub fn n_th_eval(&self, n: usize) -> Fr {

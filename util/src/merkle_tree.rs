@@ -9,11 +9,13 @@ impl Hasher for Blake3Algorithm {
     type Hash = [u8; MERKLE_ROOT_SIZE];
 
     fn hash(data: &[u8]) -> [u8; MERKLE_ROOT_SIZE] {
-        blake3::hash(data).into()
+        blake3::hash(data).as_bytes()[..MERKLE_ROOT_SIZE]
+            .try_into()
+            .unwrap()
     }
 }
 
-pub const MERKLE_ROOT_SIZE: usize = 32;
+pub const MERKLE_ROOT_SIZE: usize = 16;
 #[derive(Clone)]
 pub struct MerkleTreeProver {
     pub merkle_tree: MerkleTree<Blake3Algorithm>,
@@ -35,7 +37,7 @@ impl MerkleTreeProver {
         bytes
     }
 
-    pub fn new(leaf_values: Vec<Vec<u8>>) -> Self {
+    pub fn new(leaf_values: &Vec<Vec<u8>>) -> Self {
         let leaves = leaf_values
             .iter()
             .map(|x| Blake3Algorithm::hash(x))
@@ -55,7 +57,7 @@ impl MerkleTreeProver {
         self.merkle_tree.root().unwrap()
     }
 
-    pub fn open(&self, leaf_indices: &Vec<usize>) -> Vec<u8> {
+    pub fn open(&self, leaf_indices: &[usize]) -> Vec<u8> {
         self.merkle_tree.proof(leaf_indices).to_bytes()
     }
 }
@@ -92,12 +94,12 @@ impl MerkleRoot {
         proof_bytes: Vec<u8>,
         index: usize,
         leaf: Vec<u8>,
-        total_leaves_count: usize,
+        leave_number: usize,
     ) -> [u8; MERKLE_ROOT_SIZE] {
         let proof = MerkleProof::<Blake3Algorithm>::try_from(proof_bytes).unwrap();
         let leaf_hashes = vec![Blake3Algorithm::hash(&leaf)];
         proof
-            .root(&vec![index], &leaf_hashes, total_leaves_count)
+            .root(&vec![index], &leaf_hashes, leave_number)
             .unwrap()
     }
 }
@@ -117,7 +119,7 @@ mod tests {
             .map(|x| MerkleTreeProver::serialize_fields(&[Fr::from(x * 2), Fr::from(x * 2 + 1)]))
             .collect::<Vec<_>>();
         let leave_number = leaf_values.len();
-        let prover = MerkleTreeProver::new(leaf_values);
+        let prover = MerkleTreeProver::new(&leaf_values);
         let root = prover.commit();
         let verifier = MerkleTreeVerifier::new(leave_number, &root);
         let leaf_indices = vec![2, 3];

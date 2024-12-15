@@ -10,4 +10,5 @@ ark-ec = "0.4"
 ark-ff = "0.4"
 ark-bn254 = "0.4"
 rand = "0.8.5"
+ark-serialize = "0.4"
 util = { path = "../util" }

@@ -1,14 +1,19 @@
-use std::{borrow::Borrow, iter, usize};
+use std::iter;
 
 use ark_bn254::Fr;
 use ark_ff::Field;
-use util::mul_group::Radix2Group;
+use util::{
+    merkle_tree::{MerkleRoot, MerkleTreeProver},
+    mul_group::Radix2Group,
+};
 
 use crate::poly::{MultilinearPoly, UniPolyEvals, UniVarPoly};
 
 pub struct Proofs {
     poly: MultilinearPoly,
     replicas: Vec<UniVarPoly>,
+    first_tree: MerkleTreeProver,
+    merkle_trees: Vec<MerkleTreeProver>,
     proofs: Vec<Vec<UniPolyEvals>>,
     final_poly: UniVarPoly,
 }
@@ -18,14 +23,24 @@ impl Proofs {
         let proofs = self
             .proofs
             .iter()
-            .map(|x| {
-                let len = x.len();
-                x[n & (len - 1)].clone()
+            .map(|polies| {
+                let len = polies.len();
+                polies[n & (len - 1)].clone()
             })
             .collect::<Vec<_>>();
+        let merkle_paths = self
+            .merkle_trees
+            .iter()
+            .map(|x| {
+                let len = x.leave_num();
+                x.open(&[n & (len - 1)])
+            })
+            .collect();
         Symbol {
             poly: self.poly.clone(),
+            first_paths: self.first_tree.open(&[n]),
             replica: self.replicas[n].clone(),
+            merkle_paths,
             proofs,
             final_poly: self.final_poly.clone(),
         }
@@ -47,6 +62,8 @@ pub struct Symbol {
     poly: MultilinearPoly,
     replica: UniVarPoly,
     proofs: Vec<UniPolyEvals>,
+    first_paths: Vec<u8>,
+    merkle_paths: Vec<Vec<u8>>,
     final_poly: UniVarPoly,
 }
 
@@ -84,9 +101,17 @@ impl VeriRsProver {
         let replicas = (0..(1 << self.log_symbol_number))
             .map(|i| UniVarPoly::new((0..self.layer_number).map(|j| codewords[j][i]).collect()))
             .collect::<Vec<_>>();
+        let (first_tree, challenge) = {
+            let tree = MerkleTreeProver::new(&replicas.iter().map(|x| x.serialize()).collect());
+            let bytes = tree.commit();
+            let challenge = <Fr as Field>::from_random_bytes(&bytes).unwrap();
+            (tree, challenge)
+        };
+        let mut merkle_trees = vec![];
+
         let mut claims = replicas
             .iter()
-            .map(|x| x.eval(&19260817.into()))
+            .map(|x| x.eval(&challenge))
             .collect::<Vec<_>>();
         let inv_2 = <Fr as Field>::inverse(&2.into()).unwrap();
         let mut proofs = vec![];
@@ -102,9 +127,16 @@ impl VeriRsProver {
                     )
                 })
                 .collect::<Vec<_>>();
+            let challenge = {
+                let tree =
+                    MerkleTreeProver::new(&this_proof.iter().map(|x| x.serialize()).collect());
+                let root = tree.commit();
+                merkle_trees.push(tree);
+                <Fr as Field>::from_random_bytes(&root).unwrap()
+            };
             claims = this_proof
                 .iter()
-                .map(|x| x.clone().eval(19260817.into(), self.root_inv, inv_2))
+                .map(|x| x.clone().eval(challenge, self.root_inv, inv_2))
                 .collect();
             proofs.push(this_proof);
         }
@@ -113,6 +145,8 @@ impl VeriRsProver {
             poly: MultilinearPoly::new(data),
             replicas,
             proofs,
+            first_tree,
+            merkle_trees,
             final_poly: UniVarPoly::new({
                 let log_order = claims.len().ilog2() as usize;
                 let mut coeff = Radix2Group::new(log_order).ifft(claims);
@@ -124,7 +158,11 @@ impl VeriRsProver {
 }
 
 pub struct VeriRsVerifier {
-    locations: Vec<usize>,
+    index: usize,
+    symbol_number: usize,
+    inner_location: Vec<usize>,
+    outer_location: Vec<usize>,
+    leaves_number: Vec<usize>,
     step: usize,
     inv_2: Fr,
     omega_inv: Fr,
@@ -139,19 +177,28 @@ impl VeriRsVerifier {
         mut log_symbol_number: usize,
         code_rate: usize,
     ) -> VeriRsVerifier {
+        let sn = 1 << log_symbol_number;
         let nv = log_symbol_number - code_rate;
         let round = nv / step;
-        let mut locations = vec![];
+        let mut inner_location = vec![];
+        let mut outer_location = vec![];
+        let mut leaves_number = vec![];
         for _ in 0..round {
-            locations.push((index >> (log_symbol_number - step)) & ((1 << step) - 1));
             log_symbol_number -= step;
+            inner_location.push((index >> log_symbol_number) & ((1 << step) - 1));
+            outer_location.push(index & ((1 << log_symbol_number) - 1));
+            leaves_number.push(1 << log_symbol_number);
         }
         let inv_2 = <Fr as Field>::inverse(&2.into()).unwrap();
         let omega_inv = Radix2Group::new(step).element_inv_at(1);
         let final_point =
             Radix2Group::new(log_symbol_number).element_at(index & ((1 << log_symbol_number) - 1));
         VeriRsVerifier {
-            locations,
+            index,
+            symbol_number: sn,
+            inner_location,
+            outer_location,
+            leaves_number,
             step,
             inv_2,
             omega_inv,
@@ -164,17 +211,30 @@ impl VeriRsVerifier {
         let Symbol {
             poly,
             replica,
+            first_paths,
             proofs,
+            merkle_paths,
             final_poly,
         } = symbol;
-        let mut x = replica.eval(&19260817.into());
+        let root = MerkleRoot::get_root(first_paths, self.index, replica.serialize(), self.symbol_number);
+        let first_challenge = <Fr as Field>::from_random_bytes(&root).unwrap();
+        let mut x = replica.eval(&first_challenge);
         let mut eval_point = vec![];
 
-        for (poly, &location) in proofs.into_iter().zip(self.locations.iter()) {
-            assert_eq!(x, poly.n_th_eval(location));
-            x = poly.eval(19260817.into(), self.omega_inv, self.inv_2);
+        for ((poly, paths), ((&inner, &outer), &leave_number)) in
+            proofs.into_iter().zip(merkle_paths.into_iter()).zip(
+                self.inner_location
+                    .iter()
+                    .zip(self.outer_location.iter())
+                    .zip(self.leaves_number.iter()),
+            )
+        {
+            assert_eq!(x, poly.n_th_eval(inner));
+            let root = MerkleRoot::get_root(paths, outer, poly.serialize(), leave_number);
+            let challenge = <Fr as Field>::from_random_bytes(&root).unwrap();
+            x = poly.eval(challenge, self.omega_inv, self.inv_2);
             eval_point.append(
-                &mut iter::successors(Some(Fr::from(19260817)), |&x| Some(x * x))
+                &mut iter::successors(Some(challenge), |&x| Some(x * x))
                     .take(self.step)
                     .collect(),
             );
@@ -188,7 +248,7 @@ impl VeriRsVerifier {
                 .collect(),
         );
         eval_point.append(
-            &mut iter::successors(Some(Fr::from(19260817)), |&x| Some(x * x))
+            &mut iter::successors(Some(first_challenge), |&x| Some(x * x))
                 .take(replica.len().ilog2() as usize)
                 .collect::<Vec<_>>(),
         );
