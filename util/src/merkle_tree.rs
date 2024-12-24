@@ -1,34 +1,40 @@
+use std::marker::PhantomData;
+
 use ark_bn254::Fr;
 use ark_serialize::CanonicalSerialize;
 use rs_merkle::{Hasher, MerkleProof, MerkleTree};
 
 #[derive(Debug, Clone)]
-pub struct Blake3Algorithm {}
+pub struct Blake16 {}
 
-impl Hasher for Blake3Algorithm {
-    type Hash = [u8; MERKLE_ROOT_SIZE];
+impl Hasher for Blake16 {
+    type Hash = [u8; 16];
 
-    fn hash(data: &[u8]) -> [u8; MERKLE_ROOT_SIZE] {
-        blake3::hash(data).as_bytes()[..MERKLE_ROOT_SIZE]
-            .try_into()
-            .unwrap()
+    fn hash(data: &[u8]) -> [u8; 16] {
+        blake3::hash(data).as_bytes()[..16].try_into().unwrap()
     }
 }
 
-pub const MERKLE_ROOT_SIZE: usize = 16;
+#[derive(Debug, Clone)]
+pub struct Blake32 {}
+
+impl Hasher for Blake32 {
+    type Hash = [u8; 32];
+
+    fn hash(data: &[u8]) -> [u8; 32] {
+        blake3::hash(data).as_bytes().clone()
+    }
+}
+
 #[derive(Clone)]
-pub struct MerkleTreeProver {
-    pub merkle_tree: MerkleTree<Blake3Algorithm>,
+pub struct MerkleTreeProver<H: Hasher> {
+    pub merkle_tree: MerkleTree<H>,
     leave_num: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct MerkleTreeVerifier {
-    pub merkle_root: [u8; MERKLE_ROOT_SIZE],
-    pub leave_number: usize,
-}
+pub struct Serialize;
 
-impl MerkleTreeProver {
+impl Serialize {
     pub fn serialize_fields(v: &[Fr]) -> Vec<u8> {
         let mut bytes = vec![];
         v.iter().for_each(|x| {
@@ -36,13 +42,18 @@ impl MerkleTreeProver {
         });
         bytes
     }
+}
 
+#[derive(Debug, Clone)]
+pub struct MerkleTreeVerifier<H: Hasher> {
+    pub merkle_root: H::Hash,
+    pub leave_number: usize,
+}
+
+impl<H: Hasher> MerkleTreeProver<H> {
     pub fn new(leaf_values: &Vec<Vec<u8>>) -> Self {
-        let leaves = leaf_values
-            .iter()
-            .map(|x| Blake3Algorithm::hash(x))
-            .collect::<Vec<_>>();
-        let merkle_tree = MerkleTree::<Blake3Algorithm>::from_leaves(&leaves);
+        let leaves = leaf_values.iter().map(|x| H::hash(x)).collect::<Vec<_>>();
+        let merkle_tree = MerkleTree::<H>::from_leaves(&leaves);
         Self {
             merkle_tree,
             leave_num: leaf_values.len(),
@@ -53,7 +64,7 @@ impl MerkleTreeProver {
         self.leave_num
     }
 
-    pub fn commit(&self) -> [u8; MERKLE_ROOT_SIZE] {
+    pub fn commit(&self) -> H::Hash {
         self.merkle_tree.root().unwrap()
     }
 
@@ -62,8 +73,8 @@ impl MerkleTreeProver {
     }
 }
 
-impl MerkleTreeVerifier {
-    pub fn new(leave_number: usize, merkle_root: &[u8; MERKLE_ROOT_SIZE]) -> Self {
+impl<H: Hasher> MerkleTreeVerifier<H> {
+    pub fn new(leave_number: usize, merkle_root: &H::Hash) -> Self {
         Self {
             leave_number,
             merkle_root: merkle_root.clone(),
@@ -76,9 +87,8 @@ impl MerkleTreeVerifier {
         indices: &Vec<usize>,
         leaves: &Vec<Vec<u8>>,
     ) -> bool {
-        let proof = MerkleProof::<Blake3Algorithm>::try_from(proof_bytes).unwrap();
-        let leaves_to_prove: Vec<[u8; MERKLE_ROOT_SIZE]> =
-            leaves.iter().map(|x| Blake3Algorithm::hash(x)).collect();
+        let proof = MerkleProof::<H>::try_from(proof_bytes).unwrap();
+        let leaves_to_prove: Vec<H::Hash> = leaves.iter().map(|x| H::hash(x)).collect();
         proof.verify(
             self.merkle_root,
             indices,
@@ -88,16 +98,16 @@ impl MerkleTreeVerifier {
     }
 }
 
-pub struct MerkleRoot;
-impl MerkleRoot {
+pub struct MerkleRoot<H: Hasher>(PhantomData<H>);
+impl<H: Hasher> MerkleRoot<H> {
     pub fn get_root(
         proof_bytes: Vec<u8>,
         index: usize,
         leaf: Vec<u8>,
         leave_number: usize,
-    ) -> [u8; MERKLE_ROOT_SIZE] {
-        let proof = MerkleProof::<Blake3Algorithm>::try_from(proof_bytes).unwrap();
-        let leaf_hashes = vec![Blake3Algorithm::hash(&leaf)];
+    ) -> H::Hash {
+        let proof = MerkleProof::<H>::try_from(proof_bytes).unwrap();
+        let leaf_hashes = vec![H::hash(&leaf)];
         proof
             .root(&vec![index], &leaf_hashes, leave_number)
             .unwrap()
@@ -116,17 +126,17 @@ mod tests {
     #[test]
     fn commit_and_open() {
         let leaf_values = (0..8)
-            .map(|x| MerkleTreeProver::serialize_fields(&[Fr::from(x * 2), Fr::from(x * 2 + 1)]))
+            .map(|x| Serialize::serialize_fields(&[Fr::from(x * 2), Fr::from(x * 2 + 1)]))
             .collect::<Vec<_>>();
         let leave_number = leaf_values.len();
-        let prover = MerkleTreeProver::new(&leaf_values);
+        let prover = MerkleTreeProver::<Blake16>::new(&leaf_values);
         let root = prover.commit();
-        let verifier = MerkleTreeVerifier::new(leave_number, &root);
+        let verifier = MerkleTreeVerifier::<Blake16>::new(leave_number, &root);
         let leaf_indices = vec![2, 3];
         let proof_bytes = prover.open(&leaf_indices);
         let open_values = vec![
-            MerkleTreeProver::serialize_fields(&[Fr::from(2 * 2), Fr::from(2 * 2 + 1)]),
-            MerkleTreeProver::serialize_fields(&[Fr::from(3 * 2), Fr::from(3 * 2 + 1)]),
+            Serialize::serialize_fields(&[Fr::from(2 * 2), Fr::from(2 * 2 + 1)]),
+            Serialize::serialize_fields(&[Fr::from(3 * 2), Fr::from(3 * 2 + 1)]),
         ];
         assert!(verifier.verify(proof_bytes, &leaf_indices, &open_values));
     }

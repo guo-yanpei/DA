@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ark_bn254::Fr;
 use ark_ff::{Field, Zero};
 use util::{
-    merkle_tree::{MerkleTreeProver, MerkleTreeVerifier, MERKLE_ROOT_SIZE},
+    merkle_tree::{Blake32, MerkleTreeProver, MerkleTreeVerifier, Serialize},
     mul_group::Radix2Group,
 };
 
@@ -17,14 +17,13 @@ impl QueryResult {
         &self,
         leaf_indices: &Vec<usize>,
         leaf_size: usize,
-        merkle_verifier: &MerkleTreeVerifier,
+        merkle_verifier: &MerkleTreeVerifier<Blake32>,
     ) -> bool {
         let len = merkle_verifier.leave_number;
-
         let leaves: Vec<Vec<u8>> = leaf_indices
             .iter()
             .map(|x| {
-                MerkleTreeProver::serialize_fields(
+                Serialize::serialize_fields(
                     &(0..leaf_size)
                         .map(|j| self.values.get(&(x.clone() + j * len)).unwrap().clone())
                         .collect::<Vec<_>>(),
@@ -40,7 +39,7 @@ impl QueryResult {
 pub struct InterpolateValue {
     pub value: Vec<Fr>,
     leaf_size: usize,
-    merkle_tree: MerkleTreeProver,
+    merkle_tree: MerkleTreeProver<Blake32>,
 }
 
 impl InterpolateValue {
@@ -49,7 +48,7 @@ impl InterpolateValue {
         let mt = MerkleTreeProver::new(
             &(0..len)
                 .map(|i| {
-                    MerkleTreeProver::serialize_fields(
+                    Serialize::serialize_fields(
                         &(0..leaf_size)
                             .map(|j| value[len * j + i])
                             .collect::<Vec<_>>(),
@@ -68,7 +67,7 @@ impl InterpolateValue {
         self.merkle_tree.leave_num()
     }
 
-    pub fn commit(&self) -> [u8; MERKLE_ROOT_SIZE] {
+    pub fn commit(&self) -> [u8; 32] {
         self.merkle_tree.commit()
     }
 
@@ -92,7 +91,7 @@ impl InterpolateValue {
 }
 
 pub struct Proof {
-    interpolations: Vec<[u8; MERKLE_ROOT_SIZE]>,
+    interpolations: Vec<[u8; 32]>,
     final_value: Fr,
     query_results: Vec<QueryResult>,
 }
@@ -135,11 +134,11 @@ impl Prover {
         }
     }
 
-    fn commit(&self) -> [u8; MERKLE_ROOT_SIZE] {
+    pub fn commit(&self) -> [u8; 32] {
         self.interpolation.commit()
     }
 
-    fn prove(
+    pub fn prove(
         &self,
         groups: &Vec<Radix2Group>,
         challenges: &(Fr, Vec<Fr>),
@@ -200,12 +199,12 @@ impl Prover {
 }
 
 pub struct Verifier {
-    mt_verifier: MerkleTreeVerifier,
+    mt_verifier: MerkleTreeVerifier<Blake32>,
     poly_num: usize,
 }
 
 impl Verifier {
-    pub fn new(merkle_root: [u8; MERKLE_ROOT_SIZE], poly_num: usize, leave_number: usize) -> Self {
+    pub fn new(merkle_root: [u8; 32], poly_num: usize, leave_number: usize) -> Self {
         Verifier {
             mt_verifier: MerkleTreeVerifier::new(leave_number, &merkle_root),
             poly_num,
@@ -297,7 +296,7 @@ mod tests {
         let poly_num = 16;
         let log_degree = 12;
         let polies = (0..poly_num)
-            .map(|x| {
+            .map(|_| {
                 (0..(1 << log_degree))
                     .map(|_| <Fr as UniformRand>::rand(&mut rng))
                     .collect::<Vec<_>>()

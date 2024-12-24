@@ -3,7 +3,7 @@ use std::iter;
 use ark_bn254::Fr;
 use ark_ff::Field;
 use util::{
-    merkle_tree::{MerkleRoot, MerkleTreeProver},
+    merkle_tree::{Blake16, MerkleRoot, MerkleTreeProver},
     mul_group::Radix2Group,
 };
 
@@ -12,8 +12,8 @@ use crate::poly::{MultilinearPoly, UniPolyEvals, UniVarPoly};
 pub struct Proofs {
     poly: MultilinearPoly,
     replicas: Vec<UniVarPoly>,
-    first_tree: MerkleTreeProver,
-    merkle_trees: Vec<MerkleTreeProver>,
+    first_tree: MerkleTreeProver<Blake16>,
+    merkle_trees: Vec<MerkleTreeProver<Blake16>>,
     proofs: Vec<Vec<UniPolyEvals>>,
     final_poly: UniVarPoly,
 }
@@ -103,7 +103,7 @@ impl VeriRsProver {
             .collect::<Vec<_>>();
         let (first_tree, challenge) = {
             let tree = MerkleTreeProver::new(&replicas.iter().map(|x| x.serialize()).collect());
-            let bytes = tree.commit();
+            let bytes: [u8; 16] = tree.commit();
             let challenge = <Fr as Field>::from_random_bytes(&bytes).unwrap();
             (tree, challenge)
         };
@@ -130,7 +130,7 @@ impl VeriRsProver {
             let challenge = {
                 let tree =
                     MerkleTreeProver::new(&this_proof.iter().map(|x| x.serialize()).collect());
-                let root = tree.commit();
+                let root: [u8; 16] = tree.commit();
                 merkle_trees.push(tree);
                 <Fr as Field>::from_random_bytes(&root).unwrap()
             };
@@ -216,7 +216,12 @@ impl VeriRsVerifier {
             merkle_paths,
             final_poly,
         } = symbol;
-        let root = MerkleRoot::get_root(first_paths, self.index, replica.serialize(), self.symbol_number);
+        let root: [u8; 16] = MerkleRoot::<Blake16>::get_root(
+            first_paths,
+            self.index,
+            replica.serialize(),
+            self.symbol_number,
+        );
         let first_challenge = <Fr as Field>::from_random_bytes(&root).unwrap();
         let mut x = replica.eval(&first_challenge);
         let mut eval_point = vec![];
@@ -230,7 +235,8 @@ impl VeriRsVerifier {
             )
         {
             assert_eq!(x, poly.n_th_eval(inner));
-            let root = MerkleRoot::get_root(paths, outer, poly.serialize(), leave_number);
+            let root: [u8; 16] =
+                MerkleRoot::<Blake16>::get_root(paths, outer, poly.serialize(), leave_number);
             let challenge = <Fr as Field>::from_random_bytes(&root).unwrap();
             x = poly.eval(challenge, self.omega_inv, self.inv_2);
             eval_point.append(
