@@ -1,4 +1,4 @@
-use std::iter;
+use std::{iter, mem::size_of};
 
 use ark_bn254::Fr;
 use ark_ff::Field;
@@ -67,6 +67,15 @@ pub struct Symbol {
     final_poly: UniVarPoly,
 }
 
+impl Symbol {
+    pub fn proof_size(&self) -> usize {
+        size_of::<Fr>()
+            * (self.proofs.iter().map(|x| x.len()).sum::<usize>() + self.final_poly.len())
+            + self.first_paths.len()
+            + self.merkle_paths.iter().map(|x| x.len()).sum::<usize>()
+    }
+}
+
 impl VeriRsProver {
     pub fn setup(
         log_blob_size: usize,
@@ -92,12 +101,13 @@ impl VeriRsProver {
         }
     }
 
-    pub fn prove(&self, data: Vec<Fr>) -> Proofs {
-        let codewords = data
-            .chunks(1 << self.log_row_length)
+    pub fn encode(&self, data: Vec<Fr>) -> Vec<Vec<Fr>> {
+        data.chunks(1 << self.log_row_length)
             .map(|x| self.fft_group.fft(x.to_vec()))
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    }
 
+    pub fn prove(&self, data: Vec<Fr>, codewords: Vec<Vec<Fr>>) -> Proofs {
         let replicas = (0..(1 << self.log_symbol_number))
             .map(|i| UniVarPoly::new((0..self.layer_number).map(|j| codewords[j][i]).collect()))
             .collect::<Vec<_>>();
@@ -282,7 +292,8 @@ mod tests {
         let data = (0..(1 << log_blob_size))
             .map(|_| <Fr as UniformRand>::rand(&mut rng))
             .collect::<Vec<_>>();
-        let proofs = prover.prove(data);
+        let codewords = prover.encode(data.clone());
+        let proofs = prover.prove(data, codewords);
         let symbol = proofs.n_th_replica(103);
         let verifier = VeriRsVerifier::setup(
             103,

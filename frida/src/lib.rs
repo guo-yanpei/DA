@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, mem::size_of};
 
 use ark_bn254::Fr;
 use ark_ff::{Field, Zero};
@@ -13,6 +13,10 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
+    pub fn proof_size(&self) -> usize {
+        self.paths.len() + self.values.len() * size_of::<Fr>()
+    }
+
     pub fn verify_merkle_tree(
         &self,
         leaf_indices: &Vec<usize>,
@@ -90,10 +94,26 @@ impl InterpolateValue {
     }
 }
 
-pub struct Proof {
-    interpolations: Vec<[u8; 32]>,
+pub struct IoppCommits {
+    merkle_roots: Vec<[u8; 32]>,
     final_value: Fr,
-    query_results: Vec<QueryResult>,
+}
+
+impl IoppCommits {
+    pub fn new(merkle_roots: Vec<[u8; 32]>, final_value: Fr) -> Self {
+        IoppCommits {
+            merkle_roots,
+            final_value,
+        }
+    }
+
+    pub fn proof_size(&self) -> usize {
+        self.merkle_roots.len() * 32 + size_of::<Fr>()
+    }
+}
+
+pub struct IoppProverState {
+    interpolations: Vec<InterpolateValue>,
 }
 
 pub struct Prover {
@@ -138,12 +158,11 @@ impl Prover {
         self.interpolation.commit()
     }
 
-    pub fn prove(
+    pub fn commit_phase(
         &self,
         groups: &Vec<Radix2Group>,
         challenges: &(Fr, Vec<Fr>),
-        mut leaf_indices: Vec<usize>,
-    ) -> Proof {
+    ) -> (IoppProverState, IoppCommits) {
         let poly_interpolations = {
             let len = groups[0].size();
             let mut v = (0..len).map(|_| <Fr as Zero>::zero()).collect::<Vec<_>>();
@@ -178,23 +197,35 @@ impl Prover {
                 final_value = Some(next_evaluation[0]);
             }
         }
+        let iopp_commits = IoppCommits::new(
+            interpolations.iter().map(|x| x.commit()).collect(),
+            final_value.unwrap(),
+        );
+        (IoppProverState { interpolations }, iopp_commits)
+    }
+
+    pub fn sample(
+        &self,
+        prover_state: &IoppProverState,
+        mut leaf_indices: Vec<usize>,
+        mut domain_size: usize,
+    ) -> Vec<QueryResult> {
         let mut query_results = vec![];
         for i in 0..self.log_degree {
-            let len = groups[i].size();
-            leaf_indices = leaf_indices.iter_mut().map(|v| *v % (len >> 1)).collect();
+            domain_size >>= 1;
+            leaf_indices = leaf_indices
+                .iter_mut()
+                .map(|v| *v & (domain_size - 1))
+                .collect();
             leaf_indices.sort();
             leaf_indices.dedup();
             if i == 0 {
                 query_results.push(self.interpolation.query(&leaf_indices));
             } else {
-                query_results.push(interpolations[i - 1].query(&leaf_indices));
+                query_results.push(prover_state.interpolations[i - 1].query(&leaf_indices));
             }
         }
-        Proof {
-            interpolations: interpolations.iter().map(|x| x.commit()).collect(),
-            final_value: final_value.unwrap(),
-            query_results,
-        }
+        query_results
     }
 }
 
@@ -216,12 +247,13 @@ impl Verifier {
         groups: &Vec<Radix2Group>,
         challenges: &(Fr, Vec<Fr>),
         mut leaf_indices: Vec<usize>,
-        proof: Proof,
+        iopp_commits: IoppCommits,
+        query_results: Vec<QueryResult>,
     ) {
         let mt_verifiers = {
             let mut v = vec![];
             let mut leave_num = self.mt_verifier.leave_number;
-            for hash in proof.interpolations.iter() {
+            for hash in iopp_commits.merkle_roots.iter() {
                 leave_num /= 2;
                 v.push(MerkleTreeVerifier::new(leave_num, hash));
             }
@@ -235,7 +267,7 @@ impl Verifier {
             leaf_indices.sort();
             leaf_indices.dedup();
 
-            proof.query_results[i].verify_merkle_tree(
+            query_results[i].verify_merkle_tree(
                 &leaf_indices,
                 if i == 0 { self.poly_num * 2 } else { 2 },
                 if i == 0 {
@@ -250,12 +282,8 @@ impl Verifier {
                     let mut res = Fr::from(0);
                     let mut k = j.clone();
                     for _ in 0..self.poly_num {
-                        let x = proof.query_results[0].values.get(&k).unwrap().clone();
-                        let nx = proof.query_results[0]
-                            .values
-                            .get(&(k + len / 2))
-                            .unwrap()
-                            .clone();
+                        let x = query_results[0].values.get(&k).unwrap().clone();
+                        let nx = query_results[0].values.get(&(k + len / 2)).unwrap().clone();
                         let sum = x + nx;
                         res *= challenges.0;
                         res +=
@@ -264,19 +292,15 @@ impl Verifier {
                     }
                     res
                 } else {
-                    let x = proof.query_results[i].values.get(&j).unwrap().clone();
-                    let nx = proof.query_results[i]
-                        .values
-                        .get(&(j + len / 2))
-                        .unwrap()
-                        .clone();
+                    let x = query_results[i].values.get(&j).unwrap().clone();
+                    let nx = query_results[i].values.get(&(j + len / 2)).unwrap().clone();
                     let sum = x + nx;
                     sum + challenges.1[i] * ((x - nx) * groups[i].element_inv_at(*j) - sum)
                 };
                 if i < log_degree - 1 {
-                    assert_eq!(new_v, proof.query_results[i + 1].values[j].double());
+                    assert_eq!(new_v, query_results[i + 1].values[j].double());
                 } else {
-                    assert_eq!(new_v, proof.final_value.double());
+                    assert_eq!(new_v, iopp_commits.final_value.double());
                 }
             }
         }
@@ -317,9 +341,20 @@ mod tests {
             )
         };
         let leaf_indices = (0..30).map(|_| rng.next_u32() as usize).collect::<Vec<_>>();
-        let proof = prover.prove(&groups, &challenges, leaf_indices.clone());
+        let (prover_state, iopp_commits) = prover.commit_phase(&groups, &challenges);
+        let query_results = prover.sample(
+            &prover_state,
+            leaf_indices.clone(),
+            1 << (log_degree + coderate),
+        );
         let commit = prover.commit();
         let verifier = Verifier::new(commit, poly_num, 1 << (log_degree + coderate - 1));
-        verifier.verify(&groups, &challenges, leaf_indices, proof);
+        verifier.verify(
+            &groups,
+            &challenges,
+            leaf_indices,
+            iopp_commits,
+            query_results,
+        );
     }
 }

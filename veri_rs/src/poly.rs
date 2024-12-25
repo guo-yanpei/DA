@@ -78,6 +78,10 @@ impl UniPolyEvals {
         UniPolyEvals { evals, offset_inv }
     }
 
+    pub fn len(&self) -> usize {
+        self.evals.len()
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = vec![];
         self.evals.iter().for_each(|x| {
